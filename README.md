@@ -91,6 +91,12 @@ docker compose up -d --build
 docker logs -f dronemobile-mqtt-bridge
 ```
 
+The image is also published on the GitHub Container Registry as
+`ghcr.io/geoffmyers/dronemobile-mqtt-bridge`, for `linux/amd64` and `linux/arm64`, with the
+application code in it: `docker compose pull` fetches it instead of
+building. The compose file still mounts `./app` over that copy, so the
+code in your checkout is what runs.
+
 ## Usage
 
 On startup the bridge logs in, calls `GET /vehicle` to discover every vehicle
