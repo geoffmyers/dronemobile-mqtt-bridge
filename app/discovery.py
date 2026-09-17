@@ -69,6 +69,30 @@ def _service_device_block() -> dict:
     )
 
 
+# `build_discovery_payload` in the shared toolkit accepts only a curated
+# subset of HA Discovery fields. `device_tracker` needs `source_type` +
+# `payload_home` / `payload_not_home`, which aren't in that curated set —
+# so we hand-build the payload here rather than expanding the toolkit
+# for one consumer. Mirrors the Tractive bridge's `_device_tracker_payload`.
+def _device_tracker_payload(
+    *, name: str, unique_id: str, state_topic: str, json_attributes_topic: str,
+    device: dict, avail: dict, icon: str,
+) -> dict:
+    return {
+        "name": name,
+        "unique_id": unique_id,
+        "object_id": unique_id,
+        "state_topic": state_topic,
+        "json_attributes_topic": json_attributes_topic,
+        "payload_home": "home",
+        "payload_not_home": "not_home",
+        "source_type": "gps",
+        "icon": icon,
+        "device": device,
+        **avail,
+    }
+
+
 # ---------------------- Phase 0 vehicle telemetry (preserved verbatim) ----------------------
 
 
@@ -361,6 +385,20 @@ def discovery_specs_vehicle(
                 icon="mdi:map-marker-radius", **avail,
             ),
         ))
+
+    # device_tracker — places the vehicle on HA's Lovelace map (hand-built
+    # since the toolkit doesn't accept source_type; see
+    # `_device_tracker_payload`).
+    dt_uid = f"{dev_uid}_device_tracker"
+    items.append((
+        "device_tracker", f"{dev_uid}/device_tracker",
+        _device_tracker_payload(
+            name="Location", unique_id=dt_uid,
+            state_topic=f"{base}/device_tracker/state",
+            json_attributes_topic=f"{base}/device_tracker/attrs",
+            device=device, avail=avail, icon="mdi:car",
+        ),
+    ))
     return items
 
 

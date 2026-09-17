@@ -66,6 +66,8 @@ from ha_mqtt_bridge import (
     configure_logging,
     now_s,
     register_github_error_reporter,
+    request_with_backoff,
+    watch_ha_birth,
 )
 
 from discovery import (
@@ -115,6 +117,11 @@ MQTT_HOST = os.environ.get("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
 MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ["MQTT_PASSWORD"]
+# Off by default (current behaviour) — set MQTT_TLS=1 for a broker that
+# requires TLS; MQTT_CA_FILE points at a custom CA bundle (system trust
+# store is used when unset).
+MQTT_TLS = os.environ.get("MQTT_TLS", "0") != "0"
+MQTT_CA_FILE = os.environ.get("MQTT_CA_FILE") or None
 
 # `POLL_INTERVAL` is the legacy single-tier name — kept as fallback for
 # FAST_POLL_INTERVAL (default 60 s).
@@ -165,12 +172,16 @@ def _auth_headers(id_token: str) -> dict:
 
 
 def _get(path: str, id_token: str, *, params: dict | None = None) -> Any:
+    """GET with exponential backoff on 429/5xx (shared toolkit helper —
+    the same one `events.py` uses). A 429/5xx that survives every retry
+    raises `RetryExhaustedError` (a `RuntimeError` subclass), which the
+    main loop's per-cycle `except Exception` now catches and logs
+    instead of letting it kill the process — previously this raised a
+    bare, unguarded `RuntimeError` straight out of vehicle discovery."""
     url = f"{DRONE_BASE}{path}"
-    r = requests.get(url, headers=_auth_headers(id_token), params=params, timeout=20)
+    r = request_with_backoff("GET", url, headers=_auth_headers(id_token), params=params, timeout=20)
     if r.status_code == 401:
         raise PermissionError(f"401 from {url}")
-    if r.status_code == 429:
-        raise RuntimeError(f"429 rate limit from {url}")
     r.raise_for_status()
     if not r.content:
         return None
@@ -301,17 +312,55 @@ def publish_alert_event(pub: ThreadedPublisher, vehicle_id: str, evt: AlertEvent
         pub.publish_event(f"{base}/events/alert", payload, retain=False)
 
 
-def publish_counters(pub: ThreadedPublisher, vehicle_id: str,
-                     iot_stream: IotLogsStream, alert_stream: AlertEventStream) -> None:
-    """Recalculate 24h counters from the in-memory seen-id sets. Cheap —
-    sets are bounded to SEEN_CAP."""
-    # We don't track per-event timestamps in seen_ids, so we approximate
-    # 24h by re-fetching just the last-24h window once per MED cycle.
-    # This is a tiny extra API call but gives an accurate rolling counter.
+def _device_tracker_attrs(payload: dict) -> dict[str, Any] | None:
+    """Build the device_tracker attrs payload from a `/vehicle/{id}`
+    blob, or None if no position is available yet. Mirrors the
+    Tractive bridge's `publish_pos`/`_device_tracker_payload` pattern —
+    HA's map panel needs a `device_tracker` entity, not just numeric
+    lat/lon sensors."""
+    lat = _get_in(payload, "last_known_state.latitude")
+    lon = _get_in(payload, "last_known_state.longitude")
+    if lat is None or lon is None:
+        return None
+    try:
+        lat_f, lon_f = float(lat), float(lon)
+    except (TypeError, ValueError):
+        return None
+    attrs: dict[str, Any] = {
+        "latitude": lat_f,
+        "longitude": lon_f,
+        # DroneMobile's API doesn't expose a GPS-fix-uncertainty field —
+        # included (as None) so the attribute key is always present,
+        # same convention Tractive's device_tracker uses.
+        "gps_accuracy": _get_in(payload, "last_known_state.gps_accuracy"),
+        "source_type": "gps",
+    }
+    speed = _get_in(payload, "last_known_state.speed")
+    if speed is not None:
+        attrs["speed"] = speed
+    bearing = _get_in(payload, "last_known_state.gps_degree")
+    if bearing is not None:
+        attrs["course"] = bearing
+    return attrs
+
+
+def publish_vehicle_position(pub: ThreadedPublisher, vehicle_id: str, payload: dict) -> None:
+    """device_tracker state + attrs so the vehicle shows up on HA's
+    Lovelace map, not just as numeric lat/lon sensors (the numeric
+    sensors already exist via ENTITIES' speed/gps_degree entries).
+
+    State is `home`/`not_home`, computed from DroneMobile's own
+    `in_geofence` flag (ON when inside ANY configured geofence — for
+    an account with a single "Home" geofence that's exactly "home",
+    same approximation the account-scoped `in_geofence` binary_sensor
+    already makes)."""
     base = f"{TOPIC_PREFIX}/{vehicle_id}"
-    # The stream's `seen_ids` cardinality isn't 24h-windowed — leave the
-    # counters to the slow path that does a dedicated 24h fetch.
-    _ = (pub, base, iot_stream, alert_stream)
+    attrs = _device_tracker_attrs(payload)
+    if attrs is None:
+        return
+    dt_state = "home" if payload.get("in_geofence") else "not_home"
+    pub.publish_state(f"{base}/device_tracker/state", dt_state)
+    pub.publish_raw(f"{base}/device_tracker/attrs", json.dumps(attrs), retain=True)
 
 
 def publish_24h_counters(pub: ThreadedPublisher, vehicle_id: str, id_token: str,
@@ -498,6 +547,7 @@ def run_fast_cycle(pub, vehicle: Vehicle, id_token: str, log,
     caller can reuse it (e.g. for geofence-membership computation)."""
     payload = fetch_vehicle(vehicle.vehicle_id, id_token)
     n = publish_vehicle_telemetry(pub, vehicle.vehicle_id, payload)
+    publish_vehicle_position(pub, vehicle.vehicle_id, payload)
     if geofences:
         publish_geofence_membership(pub, vehicle.vehicle_id, payload, geofences)
     log.debug("fast cycle ok vehicle=%s published=%d", vehicle.vehicle_id, n)
@@ -560,7 +610,7 @@ def main() -> int:
         host=MQTT_HOST, port=MQTT_PORT, username=MQTT_USER, password=MQTT_PASS,
         client_id=f"dronemobile-mqtt-bridge-{uuid.uuid4().hex[:8]}",
         lwt_topic=BRIDGE_LWT_TOPIC, discovery_prefix=DISCOVERY_PREFIX,
-        health_path="/tmp/healthy",
+        health_path="/tmp/healthy", tls=MQTT_TLS, ca_file=MQTT_CA_FILE,
     )
     pub.start()
 
@@ -569,6 +619,7 @@ def main() -> int:
     iot_streams: dict[str, IotLogsStream] = {}
     alert_streams: dict[str, AlertEventStream] = {}
     discovery_published = False
+    backfill_done = False
     stopping = False
     next_fast = 0.0
     next_med = 0.0
@@ -580,6 +631,22 @@ def main() -> int:
         stopping = True
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
+
+    def _on_ha_birth() -> None:
+        # HA republishes nothing on its own restart; retained discovery
+        # configs usually survive in the broker, but not always (a
+        # broker restart with no persistence, a manual "purge retained
+        # messages"). Re-running the same discovery-publish block on
+        # HA's birth message and nudging every tier to run on the next
+        # loop iteration closes that gap without a bridge restart.
+        nonlocal discovery_published, next_fast, next_med, next_slow
+        log.info("HA birth message received; re-publishing discovery and refreshing state")
+        discovery_published = False
+        next_fast = 0.0
+        next_med = 0.0
+        next_slow = 0.0
+
+    watch_ha_birth(pub, _on_ha_birth, discovery_prefix=DISCOVERY_PREFIX)
 
     while not stopping:
         try:
@@ -628,7 +695,11 @@ def main() -> int:
                 log.info("discovery published: %d entities across %d vehicle(s) + account + service",
                          total, len(vehicles))
 
+            if not backfill_done:
                 # Phase A backfill — per-vehicle iot/logs + alert/event.
+                # Independent of discovery_published so an HA-birth
+                # re-publish of discovery doesn't also re-run (and
+                # re-count against rate limits) a full history backfill.
                 for v in vehicles:
                     iot = IotLogsStream(v.vehicle_id)
                     alt = AlertEventStream(v.vehicle_id)
@@ -644,6 +715,7 @@ def main() -> int:
                     )
                     iot_streams[v.vehicle_id] = iot
                     alert_streams[v.vehicle_id] = alt
+                backfill_done = True
 
             now = time.monotonic()
             if now >= next_fast:
@@ -688,6 +760,15 @@ def main() -> int:
                 time.sleep(30)
         except requests.RequestException as e:
             log.error("network/HTTP error: %s", e)
+        except Exception:
+            # Last-resort guard for the main loop itself — e.g. a
+            # RetryExhaustedError surfacing from vehicle discovery or
+            # the startup geofence fetch, neither of which is wrapped in
+            # its own per-call try/except the way the FAST/MED/SLOW tier
+            # runners are. Previously this class of error (an unguarded
+            # 429/5xx exhausting its retries) propagated straight out of
+            # `main()` and killed the process.
+            log.exception("poll cycle failed unexpectedly")
 
         for _ in range(5):
             if stopping:

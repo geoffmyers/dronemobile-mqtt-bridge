@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import time
 from typing import Callable
 from urllib.parse import urlparse, parse_qs
 
-import requests
+from ha_mqtt_bridge import request_with_backoff
 
 from parsers import (
     AlertEvent,
@@ -41,24 +40,27 @@ def _auth_headers(id_token: str) -> dict:
 
 
 def _get(url: str, headers: dict, params: dict | None = None, *, max_attempts: int = 4):
-    """GET with exponential backoff on 429. Returns parsed JSON or None on empty body."""
-    backoff = 2.0
-    for _ in range(max_attempts):
-        r = requests.get(url, headers=headers, params=params, timeout=20)
-        if r.status_code == 429:
-            time.sleep(backoff)
-            backoff = min(backoff * 2, 60)
-            continue
-        if r.status_code == 401:
-            raise PermissionError(f"401 from {url}")
-        r.raise_for_status()
-        if not r.content:
-            return None
-        try:
-            return r.json()
-        except ValueError:
-            return r.text
-    raise RuntimeError(f"exhausted retries on {url}")
+    """GET with exponential backoff on 429/5xx (shared toolkit helper —
+    also used by main.py's own `_get`, so there is exactly one retry
+    loop in this codebase). Returns parsed JSON or None on empty body.
+
+    Raises `PermissionError` on 401 and `ha_mqtt_bridge.RetryExhaustedError`
+    (a `RuntimeError` subclass) if every attempt is rate-limited/erroring —
+    the caller's `except Exception` per-cycle guard in main.py turns that
+    into a logged, backed-off retry next cycle instead of a crash.
+    """
+    r = request_with_backoff(
+        "GET", url, headers=headers, params=params, timeout=20, max_attempts=max_attempts,
+    )
+    if r.status_code == 401:
+        raise PermissionError(f"401 from {url}")
+    r.raise_for_status()
+    if not r.content:
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return r.text
 
 
 # ============================================================== IoT logs stream

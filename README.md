@@ -138,6 +138,8 @@ Environment variables, set in `.env`:
 | `MQTT_PORT` | `1883` | |
 | `MQTT_USER` | *(empty)* | MQTT username |
 | `MQTT_PASSWORD` | *(required)* | MQTT password |
+| `MQTT_TLS` | `0` | Set to `1` for a broker that requires TLS |
+| `MQTT_CA_FILE` | *(unset)* | Path to a custom CA bundle; leave unset to use the system trust store (only consulted when `MQTT_TLS=1`) |
 | `FAST_POLL_INTERVAL` | `60` | Seconds; also accepts the legacy name `POLL_INTERVAL` |
 | `MED_POLL_INTERVAL` | `300` | Seconds |
 | `SLOW_POLL_INTERVAL` | `3600` | Seconds |
