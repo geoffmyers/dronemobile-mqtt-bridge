@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/icon.svg" width="96" height="96" alt="DroneMobile MQTT Bridge icon">
+  <img src="docs/icon.svg" width="256" height="256" alt="DroneMobile MQTT Bridge icon">
 </p>
 
 # DroneMobile MQTT Bridge
